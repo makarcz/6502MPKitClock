@@ -35,7 +35,7 @@ data_read      = $9003  ; LCD data read address
 ; frequency (IRQ) measured at test point TP1 to be 98.71 Hz
 
 tick_reload    = 98     ; SYSTICK reload value (ideal would be 100 Hz: 99)
-skip_reload    = 138    ; How often to skip IRQ service, SKIPCT reload value
+skip_reload    = 135    ; How often to skip IRQ service, SKIPCT reload value
 
 ; U12 (74HC573 data latch) pin assignments
 ; for 7 Segment common cathode lines

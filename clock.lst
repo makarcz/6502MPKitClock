@@ -1,0 +1,678 @@
+0001   0000             ; $Id: clock.asm 283 2020-11-15 07:12:35Z mkarcz $
+0002   0000             ;-----------------------------------------------------------------------------
+0003   0000             ;                          clock.asm
+0004   0000             ;-----------------------------------------------------------------------------
+0005   0000             
+0006   0000             ; Interrupt driven clock (10 ms TICK) on the 7-seg display
+0007   0000             ; for the 6502 MP Kit.
+0008   0000             ; Uses some routines from 7seg.asm (Jeff Rosengarden)
+0009   0000             ; Uses LCD driver routines provided with the kit.
+0010   0000             ; Marek Karcz, NOV 2020
+0011   0000             
+0012   0000             ;-----------------------------------------------------------------------------
+0013   0000             
+0014   0000             ; assembler directives
+0015   0000                .LOCALLABELCHAR "?"
+0016   0000             
+0017   0000             ;-----------------------------------------------------------------------------
+0018   0000             ; MAIN CONSTANTS 
+0019   0000             ;-----------------------------------------------------------------------------
+0020   0000             
+0021   0000             SEGTAB         = $C906  ; 7-seg bit patterns for character disp. in ROM
+0022   0000             GPIO1          = $8000  ; LED-s
+0023   0000             PORT0          = $8001  ; Keypad port
+0024   0000             PORT1          = $8002  ; 74HC573 for common cathode pins (U12 in circuit)
+0025   0000             PORT2          = $8003  ; 74HC573 for digits (U11 in circuit)
+0026   0000             BUSY           = $80    ; LCD busy bit       
+0027   0000             command_write  = $9000  ; LCD write command address
+0028   0000             data_write     = $9001  ; LCD write data address
+0029   0000             command_read   = $9002  ; LCD read command address
+0030   0000             data_read      = $9003  ; LCD data read address
+0031   0000             
+0032   0000             ; use / change both constants below to calibrate clock accuracy
+0033   0000             ; to compensate for imperfect system clock
+0034   0000             ; settings below are good for system clock 999,700 kHz, TICK pin
+0035   0000             ; frequency (IRQ) measured at test point TP1 to be 98.71 Hz
+0036   0000             
+0037   0000             tick_reload    = 98     ; SYSTICK reload value (ideal would be 100 Hz: 99)
+0038   0000             skip_reload    = 135    ; How often to skip IRQ service, SKIPCT reload value
+0039   0000             
+0040   0000             ; U12 (74HC573 data latch) pin assignments
+0041   0000             ; for 7 Segment common cathode lines
+0042   0000             
+0043   0000             SEG1D1  = %10011111   ; PC5 
+0044   0000             SEG1D2  = %10101111   ; PC4
+0045   0000             SEG1D3  = %10110111   ; PC3
+0046   0000             SEG1D4  = %10111011   ; PC2
+0047   0000             SEG2D1  = %10111101   ; PC1
+0048   0000             SEG2D2  = %10111110   ; PC0
+0049   0000             
+0050   0000             ; OR mask for decimal point
+0051   0000             
+0052   0000             DPMASK  = %01000000
+0053   0000             
+0054   0000             ;-----------------------------------------------------------------------------
+0055   0000             ; Variables
+0056   0000             ;-----------------------------------------------------------------------------
+0057   0000             
+0058   0000             ; Clock registers
+0059   0000             
+0060   0000             SYSTICK         .EQU    0000H
+0061   0000             SECONDS         .EQU    0001H
+0062   0000             MINUTES         .EQU    0002H
+0063   0000             HOURS           .EQU    0003H
+0064   0000             WLED            .EQU    0004H   ; "wandering" LED on the GPIO1 LED-s line
+0065   0000             
+0066   0000             ; 7-seg multiplexing
+0067   0000             
+0068   0000             DISPDIGIT       .EQU    0005H   ; which digit (segment) is currently on
+0069   0000             DIGITS          .EQU    0006H   ; $06, $07, $08, $09, $0A, $0B (HHMMSS)
+0070   0000             
+0071   0000             ; Other
+0072   0000             
+0073   0000             SACC            .EQU    000CH   ; Temporary store for ACC
+0074   0000             TEMP            .EQU    000DH   ; 2 bytes, temporary results from subr.
+0075   0000             SCREG           .EQU    000FH   ; Set Clock, register being set now
+0076   0000                                             ; (0 - hours, 1 - minutes, 2 - seconds)
+0077   0000             BKPIRQ          .EQU    0010H   ; 2 bytes, backup of original IRQ vector
+0078   0000             SKIPCT          .EQU    0012H   ; Counter for skipping IRQ to compensate
+0079   0000                                             ; system clock inaccuracy
+0080   0000             
+0081   0000             ;-----------------------------------------------------------------------------
+0082   0000             ;       EXECUTABLE CODE BEGINS AT ADDRESS $0200
+0083   0000             ;
+0084   0000             ;-----------------------------------------------------------------------------
+0085   0000             
+0086   0200                 *= $0200
+0087   0200             
+0088   0200 D8          INIT:    CLD
+0089   0201 78                   SEI               ; disable interrupts
+0090   0202 A9 62                LDA #tick_reload  ; initialize variables
+0091   0204 85 0F                STA SCREG
+0092   0206 85 00                STA SYSTICK
+0093   0208 A9 87                LDA #skip_reload
+0094   020A 85 12                STA SKIPCT
+0095   020C A9 00                LDA #0
+0096   020E 85 05                STA DISPDIGIT
+0097   0210 85 01                STA SECONDS
+0098   0212 85 02                STA MINUTES
+0099   0214 85 03                STA HOURS
+0100   0216 A9 01                LDA #1
+0101   0218 85 04                STA WLED
+0102   021A 8D 00 80             STA GPIO1
+0103   021D A5 FE                LDA $FE           ; Backup original IRQ vector
+0104   021F 85 10                STA BKPIRQ
+0105   0221 A5 FF                LDA $FF
+0106   0223 85 11                STA BKPIRQ+1
+0107   0225 A9 D0                LDA #IRQS&0FFH    ; Set IRQ service vector
+0108   0227 85 FE                STA $FE
+0109   0229 A9 04                LDA #(IRQS>>8)
+0110   022B 85 FF                STA $FF
+0111   022D 58                   CLI               ; enable interrupts
+0112   022E 20 EF 03             JSR SetClock
+0113   0231 20 78 05             JSR LcdClkInfo
+0114   0234             
+0115   0234 20 AA 02    START:   JSR DispTime
+0116   0237 A9 08                LDA #%00001000    ; test for '+' key press
+0117   0239 2C 01 80             BIT PORT0         ; was '+' pressed?
+0118   023C D0 0C                BNE ST_01         ; no, jump to next test
+0119   023E 20 B5 04             JSR ShortDelay    ; yes, '+' pressed, debounce
+0120   0241 20 EF 03             JSR SetClock      ; pause the clock, go to setup mode
+0121   0244 20 78 05             JSR LcdClkInfo    ; after return from setup, change menu
+0122   0247 4C 34 02             JMP START         ; and continue
+0123   024A 70 E8       ST_01:   BVS START         ; was 'REP' pressed?
+0124   024C                                        ; no, branch to START / yes, end program
+0125   024C 20 42 05             JSR InitLcd       ; clear LCD at exit
+0126   024F 78                   SEI               ; Restore original IRQ vector
+0127   0250 A5 10                LDA BKPIRQ        ; (monitor program uses it)
+0128   0252 85 FE                STA $FE
+0129   0254 A5 11                LDA BKPIRQ+1
+0130   0256 85 FF                STA $FF
+0131   0258 58                   CLI
+0132   0259                     
+0133   0259 00                   BRK               ; return to monitor
+0134   025A 00                   BRK
+0135   025B               
+0136   025B             ;-----------------------------------------------------------------------------
+0137   025B             ; Delay routines for PWM (pulse width modulation) to control brightness of
+0138   025B             ; 7SEG display. Ratio between ON and OFF can be adjusted with the value in
+0139   025B             ; the Y register.
+0140   025B             ; PWM ratio = Y in DELAYON / 10
+0141   025B             ;-----------------------------------------------------------------------------
+0142   025B             
+0143   025B A0 05       DELAYON:  LDY #5        
+0144   025D 88          DELAY2:   DEY
+0145   025E D0 FD                 BNE DELAY2
+0146   0260 60                    RTS
+0147   0261                       
+0148   0261 A0 0A       DELAYOFF: LDY #10
+0149   0263 88          DELAY3:   DEY
+0150   0264 D0 FD                 BNE DELAY3
+0151   0266 60                    RTS
+0152   0267                       
+0153   0267             ;-----------------------------------------------------------------------------
+0154   0267             ; 7 Segment Handling Routines (using PWM)
+0155   0267             ;-----------------------------------------------------------------------------
+0156   0267                       
+0157   0267 20 5B 02    DIGONOFF: JSR DELAYON         ; run the DELAYON loop
+0158   026A A9 00                 LDA #%00000000      ; turn the segments off
+0159   026C 8D 03 80              STA PORT2
+0160   026F 20 61 02              JSR DELAYOFF        ; run the DELAYOFF loop
+0161   0272 60                    RTS
+0162   0273                       
+0163   0273             ;-----------------------------------------------------------------------------
+0164   0273             ; Put character on 7-seg display.
+0165   0273             ; cout requires Segment control value in Accum
+0166   0273             ;      requires char to display in X Reg         
+0167   0273             ;-----------------------------------------------------------------------------
+0168   0273             
+0169   0273 48          COUT:     PHA
+0170   0274 A5 0F                 LDA SCREG           ; SCREG < 3 - setup mode
+0171   0276 C9 03                 CMP #3              ; should segment blink?
+0172   0278 B0 20                 BCS CO_NB           ; no, carry on
+0173   027A 24 00                 BIT SYSTICK         ; blink only if bit 6 of SYSTICK is set
+0174   027C 50 1C                 BVC CO_NB           ; (roughly every second, slightly more)
+0175   027E A5 0F                 LDA SCREG           ; it's blinky time, determine which
+0176   0280 C9 02                 CMP #2              ; digits should blink (HH, MM or SS)
+0177   0282 F0 0B                 BEQ CO_BSEC         ; it's SS
+0178   0284 C9 01                 CMP #1
+0179   0286 F0 0E                 BEQ CO_BMIN         ; it's MM
+0180   0288 68                    PLA                 ; it's HH
+0181   0289 09 30                 ORA #%00110000
+0182   028B 48                    PHA
+0183   028C 4C 9A 02              JMP CO_NB
+0184   028F 68          CO_BSEC:  PLA
+0185   0290 09 03                 ORA #%00000011
+0186   0292 48                    PHA
+0187   0293 4C 9A 02              JMP CO_NB
+0188   0296 68          CO_BMIN:  PLA
+0189   0297 09 0C                 ORA #%00001100
+0190   0299 48                    PHA
+0191   029A 68          CO_NB:    PLA
+0192   029B 8D 02 80              STA PORT1           ; indicate which digit to activate
+0193   029E 8A                    TXA
+0194   029F 8D 03 80              STA PORT2           ; indicate which character to display
+0195   02A2 98                    TYA
+0196   02A3 48                    PHA                 ; push current Y Reg value to stack
+0197   02A4 20 67 02              JSR DIGONOFF        ; turn digit on & off using PWM
+0198   02A7 68                    PLA
+0199   02A8 A8                    TAY                 ; restore our Y Reg value from stack
+0200   02A9 60                    RTS
+0201   02AA             
+0202   02AA             ;-----------------------------------------------------------------------------
+0203   02AA             ; Display currently active digit of time (mux) and advance to next
+0204   02AA             ;-----------------------------------------------------------------------------
+0205   02AA             
+0206   02AA 20 C0 03    DispTime:   JSR ConvTime2Digits
+0207   02AD A6 05                   LDX DISPDIGIT         ; Retrieve segment control value
+0208   02AF BD 9D 05                LDA SEG,X
+0209   02B2 48                      PHA                   ; Store segment control to stack
+0210   02B3 A6 05                   LDX DISPDIGIT         ; Retrieve char to display
+0211   02B5 B5 06                   LDA DIGITS,X
+0212   02B7 AA                      TAX
+0213   02B8 BD 06 C9                LDA SEGTAB,X          ; get actual 7-seg code for digit
+0214   02BB 48                      PHA                   ; Store 7-seg code to stack
+0215   02BC A5 05                   LDA DISPDIGIT         ; Check if decimal point should be
+0216   02BE C9 01                   CMP #1                ; enabled (digits 1 or 3: HH.MM.SS)
+0217   02C0 F0 07                   BEQ YesDP
+0218   02C2 C9 03                   CMP #3
+0219   02C4 F0 03                   BEQ YesDP
+0220   02C6 18                      CLC
+0221   02C7 90 04                   BCC NoDP
+0222   02C9 68          YesDP:      PLA                   ; 7-seg code, stack -> A
+0223   02CA 09 40                   ORA #DPMASK           ; Enable decimal point
+0224   02CC 48                      PHA                   ; Store to stack
+0225   02CD 68          NoDP:       PLA
+0226   02CE AA                      TAX                   ; Char to display, stack -> X
+0227   02CF 68                      PLA                   ; Segment control, stack -> A
+0228   02D0 20 73 02                JSR COUT
+0229   02D3 E6 05                   INC DISPDIGIT         ; Advance display mux to next digit
+0230   02D5 A5 05                   LDA DISPDIGIT
+0231   02D7 C9 06                   CMP #6
+0232   02D9 90 04                   BCC DispTEnd
+0233   02DB A9 00                   LDA #0                ; DISPDIGIT == 6, reset
+0234   02DD 85 05                   STA DISPDIGIT
+0235   02DF 60          DispTEnd:   RTS
+0236   02E0             
+0237   02E0             ;-----------------------------------------------------------------------------
+0238   02E0             ; Convert byte (A) into 2 decimal digits: TEMP, TEMP+1
+0239   02E0             ; Works for A=0..99
+0240   02E0             ;-----------------------------------------------------------------------------
+0241   02E0             
+0242   02E0             ConvByte2Dec:
+0243   02E0 85 0C                   STA SACC
+0244   02E2 8A                      TXA
+0245   02E3 48                      PHA
+0246   02E4 18                      CLC
+0247   02E5 A5 0C                   LDA SACC
+0248   02E7 65 0C                   ADC SACC
+0249   02E9 AA                      TAX
+0250   02EA BD F8 02                LDA DECTBL,X
+0251   02ED 85 0D                   STA TEMP
+0252   02EF E8                      INX
+0253   02F0 BD F8 02                LDA DECTBL,X
+0254   02F3 85 0E                   STA TEMP+1
+0255   02F5 68                      PLA
+0256   02F6 AA                      TAX
+0257   02F7 60                      RTS
+0258   02F8             
+0259   02F8 00 00 00 01 DECTBL:     .BYTE   0,0,0,1,0,2,0,3,0,4,0,5,0,6,0,7,0,8,0,9
+0259   02FC 00 02 00 03 
+0259   0300 00 04 00 05 
+0259   0304 00 06 00 07 
+0259   0308 00 08 00 09 
+0260   030C 01 00 01 01             .BYTE   1,0,1,1,1,2,1,3,1,4,1,5,1,6,1,7,1,8,1,9
+0260   0310 01 02 01 03 
+0260   0314 01 04 01 05 
+0260   0318 01 06 01 07 
+0260   031C 01 08 01 09 
+0261   0320 02 00 02 01             .BYTE   2,0,2,1,2,2,2,3,2,4,2,5,2,6,2,7,2,8,2,9
+0261   0324 02 02 02 03 
+0261   0328 02 04 02 05 
+0261   032C 02 06 02 07 
+0261   0330 02 08 02 09 
+0262   0334 03 00 03 01             .BYTE   3,0,3,1,3,2,3,3,3,4,3,5,3,6,3,7,3,8,3,9
+0262   0338 03 02 03 03 
+0262   033C 03 04 03 05 
+0262   0340 03 06 03 07 
+0262   0344 03 08 03 09 
+0263   0348 04 00 04 01             .BYTE   4,0,4,1,4,2,4,3,4,4,4,5,4,6,4,7,4,8,4,9
+0263   034C 04 02 04 03 
+0263   0350 04 04 04 05 
+0263   0354 04 06 04 07 
+0263   0358 04 08 04 09 
+0264   035C 05 00 05 01             .BYTE   5,0,5,1,5,2,5,3,5,4,5,5,5,6,5,7,5,8,5,9
+0264   0360 05 02 05 03 
+0264   0364 05 04 05 05 
+0264   0368 05 06 05 07 
+0264   036C 05 08 05 09 
+0265   0370 06 00 06 01             .BYTE   6,0,6,1,6,2,6,3,6,4,6,5,6,6,6,7,6,8,6,9
+0265   0374 06 02 06 03 
+0265   0378 06 04 06 05 
+0265   037C 06 06 06 07 
+0265   0380 06 08 06 09 
+0266   0384 07 00 07 01             .BYTE   7,0,7,1,7,2,7,3,7,4,7,5,7,6,7,7,7,8,7,9
+0266   0388 07 02 07 03 
+0266   038C 07 04 07 05 
+0266   0390 07 06 07 07 
+0266   0394 07 08 07 09 
+0267   0398 08 00 08 01             .BYTE   8,0,8,1,8,2,8,3,8,4,8,5,8,6,8,7,8,8,8,9
+0267   039C 08 02 08 03 
+0267   03A0 08 04 08 05 
+0267   03A4 08 06 08 07 
+0267   03A8 08 08 08 09 
+0268   03AC 09 00 09 01             .BYTE   9,0,9,1,9,2,9,3,9,4,9,5,9,6,9,7,9,8,9,9
+0268   03B0 09 02 09 03 
+0268   03B4 09 04 09 05 
+0268   03B8 09 06 09 07 
+0268   03BC 09 08 09 09 
+0269   03C0             
+0270   03C0             ;-----------------------------------------------------------------------------
+0271   03C0             ; Convert 3 clock time keeping registers to 6 decimal digits: HHMMSS
+0272   03C0             ;-----------------------------------------------------------------------------
+0273   03C0             
+0274   03C0             ConvTime2Digits:
+0275   03C0             
+0276   03C0 A5 03                LDA HOURS
+0277   03C2 20 E0 02             JSR ConvByte2Dec
+0278   03C5 A2 00                LDX #0
+0279   03C7 A5 0D                LDA TEMP
+0280   03C9 95 06                STA DIGITS,X
+0281   03CB E8                   INX
+0282   03CC A5 0E                LDA TEMP+1
+0283   03CE 95 06                STA DIGITS,X
+0284   03D0 A5 02                LDA MINUTES
+0285   03D2 20 E0 02             JSR ConvByte2Dec
+0286   03D5 A5 0D                LDA TEMP
+0287   03D7 E8                   INX
+0288   03D8 95 06                STA DIGITS,X
+0289   03DA A5 0E                LDA TEMP+1
+0290   03DC E8                   INX
+0291   03DD 95 06                STA DIGITS,X
+0292   03DF A5 01                LDA SECONDS
+0293   03E1 20 E0 02             JSR ConvByte2Dec
+0294   03E4 A5 0D                LDA TEMP
+0295   03E6 E8                   INX
+0296   03E7 95 06                STA DIGITS,X
+0297   03E9 A5 0E                LDA TEMP+1
+0298   03EB E8                   INX
+0299   03EC 95 06                STA DIGITS,X
+0300   03EE 60                   RTS
+0301   03EF             
+0302   03EF             ;-----------------------------------------------------------------------------
+0303   03EF             ; Set clock using keypad and 7-seg LED display.
+0304   03EF             ;-----------------------------------------------------------------------------
+0305   03EF             
+0306   03EF             SetClock:
+0307   03EF 20 42 05             JSR InitLcd
+0308   03F2 A2 00                LDX #0
+0309   03F4 86 0F                STX SCREG
+0310   03F6 BD C4 05    SC_l001: LDA lcd_text_03,x
+0311   03F9 F0 06                BEQ SC_nxt
+0312   03FB 20 71 05    		   JSR putch_lcd
+0313   03FE E8                   INX
+0314   03FF D0 F5                BNE SC_l001
+0315   0401 A0 00       SC_nxt:  LDY #0
+0316   0403 A2 01                LDX #1
+0317   0405 20 57 05             JSR goto_xy
+0318   0408 A2 00                LDX #0
+0319   040A BD D5 05    SC_l0a1: LDA lcd_text_04,x
+0320   040D F0 06                BEQ SC_l002
+0321   040F 20 71 05    		   JSR putch_lcd
+0322   0412 E8                   INX
+0323   0413 D0 F5                BNE SC_l0a1
+0324   0415 20 AA 02    SC_l002: JSR DispTime
+0325   0418 2C 01 80             BIT PORT0         ; test for REP key press (bit 6, flag V)
+0326   041B 70 19                BVS SC_l0a2       ; key not pressed, branch to next test
+0327   041D A5 0F                LDA SCREG         ; REP pressed, which clock reg. we're increasing?
+0328   041F C9 02                CMP #2            ; seconds?
+0329   0421 F0 66                BEQ SC_SS
+0330   0423 C9 01                CMP #1            ; minutes?
+0331   0425 F0 71                BEQ SC_SM
+0332   0427 E6 03                INC HOURS         ; none of the above, increment hours
+0333   0429 A5 03                LDA HOURS
+0334   042B C9 18                CMP #24
+0335   042D D0 78                BNE SC_l004
+0336   042F A9 00                LDA #0
+0337   0431 85 03                STA HOURS
+0338   0433 4C A7 04             JMP SC_l004
+0339   0436 A9 02       SC_l0a2: LDA #%00000010    ; test for '-' key press
+0340   0438 2C 01 80             BIT PORT0         ; was '-' pressed?
+0341   043B D0 37                BNE SC_l0a3       ; no, branch to next test
+0342   043D A5 0F                LDA SCREG         ; '-' pressed, which clock reg. we're decrementing?
+0343   043F C9 02                CMP #2            ; seconds?
+0344   0441 F0 13                BEQ SC_SS2
+0345   0443 C9 01                CMP #1            ; minutes?
+0346   0445 F0 1E                BEQ SC_SM2
+0347   0447 C6 03                DEC HOURS         ; none of the above, decrement hours
+0348   0449 A5 03                LDA HOURS
+0349   044B C9 FF                CMP #255
+0350   044D D0 58                BNE SC_l004
+0351   044F A9 17                LDA #23
+0352   0451 85 03                STA HOURS
+0353   0453 4C A7 04             JMP SC_l004
+0354   0456 C6 01       SC_SS2:  DEC SECONDS       ; decrement seconds
+0355   0458 A5 01                LDA SECONDS
+0356   045A C9 FF                CMP #255
+0357   045C D0 49                BNE SC_l004
+0358   045E A9 3B                LDA #59
+0359   0460 85 01                STA SECONDS
+0360   0462 4C A7 04             JMP SC_l004
+0361   0465 C6 02       SC_SM2:  DEC MINUTES
+0362   0467 A5 02                LDA MINUTES
+0363   0469 C9 FF                CMP #255
+0364   046B D0 3A                BNE SC_l004
+0365   046D A9 3B                LDA #59
+0366   046F 85 02                STA MINUTES
+0367   0471 4C A7 04             JMP SC_l004
+0368   0474 A9 08       SC_l0a3: LDA #%00001000    ; test for '+' key press
+0369   0476 2C 01 80             BIT PORT0         ; was '+' pressed?
+0370   0479 D0 9A                BNE SC_l002       ; no, jump to loop
+0371   047B 20 B5 04    SC_l003: JSR ShortDelay    ; '+' pressed, key debounce
+0372   047E E6 0F                INC SCREG         ; and advance to next clock register
+0373   0480 A5 0F                LDA SCREG
+0374   0482 C9 03                CMP #3            ; are we done?
+0375   0484 D0 8F                BNE SC_l002       ; nope, continue
+0376   0486 4C AD 04             JMP SC_End        ; yes, jump to end
+0377   0489 E6 01       SC_SS:   INC SECONDS       ; increment seconds
+0378   048B A5 01                LDA SECONDS
+0379   048D C9 3C                CMP #60
+0380   048F D0 16                BNE SC_l004
+0381   0491 A9 00                LDA #0
+0382   0493 85 01                STA SECONDS
+0383   0495 4C A7 04             JMP SC_l004
+0384   0498 E6 02       SC_SM:   INC MINUTES       ; increment minutes
+0385   049A A5 02                LDA MINUTES
+0386   049C C9 3C                CMP #60
+0387   049E D0 07                BNE SC_l004
+0388   04A0 A9 00                LDA #0
+0389   04A2 85 02                STA MINUTES
+0390   04A4 4C A7 04             JMP SC_l004
+0391   04A7 20 B5 04    SC_l004: JSR ShortDelay    ; for key debounce
+0392   04AA 4C 15 04             JMP SC_l002
+0393   04AD 60          SC_End:  RTS
+0394   04AE             
+0395   04AE             ;-----------------------------------------------------------------------------
+0396   04AE             ; SYSTICK is incremented in IRQ service routine if clock is in setup mode
+0397   04AE             ; every 10 ms. Bit 6 is used to decide when the segments representing
+0398   04AE             ; clock register currently being set should blink. Routine below clears
+0399   04AE             ; bit 6 of SYSTICK to turn the segments ON, this is needed after the
+0400   04AE             ; key on the keppad is pressed so user can see the changing value on the
+0401   04AE             ; display uninterrupted by blinking.
+0402   04AE             ;-----------------------------------------------------------------------------
+0403   04AE             
+0404   04AE             TempBlinkDis:
+0405   04AE A5 00                LDA SYSTICK
+0406   04B0 29 BF                AND #%10111111    ; clear bit 6 - temp. blink disable, for user
+0407   04B2 85 00                STA SYSTICK       ; to see digits change while key is pressed
+0408   04B4 60                   RTS
+0409   04B5             
+0410   04B5             ;-----------------------------------------------------------------------------
+0411   04B5             ; Delay used to debounce key press during clock setup.
+0412   04B5             ; At the same time user needs to see changing digits without
+0413   04B5             ; blinking f the key was pressed (or is held down), therefore subroutine
+0414   04B5             ; TempBlinkDis is called in the inner loop before each call to DispTime.
+0415   04B5             ;-----------------------------------------------------------------------------
+0416   04B5             
+0417   04B5             ShortDelay:
+0418   04B5 48                   PHA
+0419   04B6 A2 FF                LDX #$FF
+0420   04B8 A0 02       SD_l000: LDY #$02       ; outer loop
+0421   04BA 8A                   TXA
+0422   04BB 48                   PHA
+0423   04BC 88          SD_l001: DEY            ; inner loop
+0424   04BD 98                   TYA
+0425   04BE 48                   PHA
+0426   04BF 20 AE 04             JSR TempBlinkDis
+0427   04C2 20 AA 02             JSR DispTime
+0428   04C5 68                   PLA
+0429   04C6 A8                   TAY
+0430   04C7 D0 F3                BNE SD_l001    ; end of inner loop
+0431   04C9 68                   PLA
+0432   04CA AA                   TAX
+0433   04CB CA                   DEX
+0434   04CC D0 EA                BNE SD_l000    ; end of outer loop
+0435   04CE 68                   PLA
+0436   04CF 60                   RTS
+0437   04D0             
+0438   04D0             ;-----------------------------------------------------------------------------
+0439   04D0             ; IRQ service routine, timekeeping (called every 10 ms or 100 times / sec)
+0440   04D0             ;-----------------------------------------------------------------------------
+0441   04D0             
+0442   04D0 48          IRQS:       PHA               ; Preserve A on stack
+0443   04D1 C6 12                   DEC SKIPCT        ; Decrement skip IRQ counter
+0444   04D3 A5 12                   LDA SKIPCT
+0445   04D5 D0 06                   BNE IRQS_L00      ; Not yet 0, continue with service
+0446   04D7 A9 87                   LDA #skip_reload  ; Skip counter == 0, reload and
+0447   04D9 85 12                   STA SKIPCT        ; skip the service
+0448   04DB 68                      PLA
+0449   04DC 40                      RTI
+0450   04DD A5 0F       IRQS_L00:   LDA SCREG         ; check if setup mode
+0451   04DF C9 03                   CMP #3
+0452   04E1 B0 04                   BCS IRQS_CLOCK    ; not setup mode, branch to full IRQ service
+0453   04E3 E6 00                   INC SYSTICK       ; setup mode, only increment SYSTICK and
+0454   04E5 68                      PLA               ; return
+0455   04E6 40                      RTI
+0456   04E7 8A          IRQS_CLOCK: TXA               ; full IRQ service / timekeeping begins here
+0457   04E8 48                      PHA               ; Preserve X on stack
+0458   04E9 A2 00                   LDX #0
+0459   04EB C6 00                   DEC SYSTICK       ; when SYSTICK reaches 0, one second of time
+0460   04ED D0 2E                   BNE IRQS_END      ; has passed, otherwise nothing to do
+0461   04EF A9 62                   LDA #tick_reload  ; SYSTICK == 0, reload
+0462   04F1 85 00                   STA SYSTICK
+0463   04F3 E6 01                   INC SECONDS       ; increment seconds
+0464   04F5 18                      CLC               ; shift "wandering" LED on the LED-s line
+0465   04F6 26 04                   ROL WLED          ; to the left in circular fashion (disapear
+0466   04F8 90 02                   BCC IRQS_00       ; on the left, reappear on the right)
+0467   04FA 26 04                   ROL WLED
+0468   04FC A5 04       IRQS_00:    LDA WLED
+0469   04FE 8D 00 80                STA GPIO1
+0470   0501 A5 01                   LDA SECONDS
+0471   0503 C9 3C                   CMP #60
+0472   0505 90 16                   BCC IRQS_END
+0473   0507 86 01                   STX SECONDS       ; SECONDS >= 60, reset
+0474   0509 E6 02                   INC MINUTES       ; and increment MINUTES
+0475   050B A5 02                   LDA MINUTES
+0476   050D C9 3C                   CMP #60
+0477   050F 90 0C                   BCC IRQS_END
+0478   0511 86 02                   STX MINUTES       ; MINUTES >= 60, reset
+0479   0513 E6 03                   INC HOURS         ; and increment hours
+0480   0515 A5 03                   LDA HOURS
+0481   0517 C9 18                   CMP #24
+0482   0519 90 02                   BCC IRQS_END
+0483   051B 86 03                   STX HOURS         ; HOURS >= 24, reset
+0484   051D 68          IRQS_END:   PLA               ; Restore X from stack
+0485   051E AA                      TAX
+0486   051F 68                      PLA               ; Restore A from stack
+0487   0520 40                      RTI
+0488   0521             
+0489   0521             ;-----------------------------------------------------------------------------
+0490   0521             ; LCD driver routines.
+0491   0521             ;-----------------------------------------------------------------------------
+0492   0521             
+0493   0521             ; Wait until LCD ready bit set
+0494   0521             
+0495   0521 48          LcdReady:   PHA
+0496   0522 AD 02 90    ready:      LDA command_read
+0497   0525 29 80                   AND #BUSY
+0498   0527 D0 F9                   BNE ready   ; loop if busy flag = 1
+0499   0529 68                      PLA
+0500   052A 60          		      RTS
+0501   052B             		
+0502   052B             ; Write command to LCD module
+0503   052B             
+0504   052B             LCD_command_write: 
+0505   052B 20 21 05                JSR LcdReady
+0506   052E 8D 00 90                STA command_write
+0507   0531 60          		      RTS
+0508   0532             
+0509   0532             ; Write data to LCD module
+0510   0532             
+0511   0532             LCD_data_write:
+0512   0532 20 21 05                JSR LcdReady
+0513   0535 8D 01 90                STA data_write
+0514   0538 60                      RTS
+0515   0539             
+0516   0539             ; Clear screen of LCD module
+0517   0539             
+0518   0539 20 21 05    clr_screen: JSR LcdReady
+0519   053C A9 01                   LDA #1
+0520   053E 20 2B 05    		      JSR LCD_command_write
+0521   0541 60                      RTS
+0522   0542             
+0523   0542             ; Initialize LCD module
+0524   0542             
+0525   0542 A9 38       InitLcd:    LDA #38H
+0526   0544 20 2B 05                JSR LCD_command_write
+0527   0547 A9 0C                   LDA #0CH
+0528   0549 20 2B 05    	         JSR LCD_command_write
+0529   054C 20 39 05                JSR clr_screen
+0530   054F A2 00                   LDX #0
+0531   0551 A0 00       		      LDY #0
+0532   0553 20 57 05    		      JSR goto_xy
+0533   0556 60                      RTS
+0534   0557             
+0535   0557             ; goto_xy(x,y)
+0536   0557             ; entry: Y = y position
+0537   0557             ;        X = x position
+0538   0557             
+0539   0557 8A          goto_xy:    TXA
+0540   0558 C9 00                   CMP #0
+0541   055A D0 08       		      BNE case1
+0542   055C 98                      TYA
+0543   055D 18          		      CLC
+0544   055E 69 80                   ADC #80H
+0545   0560 20 2B 05                JSR LCD_command_write
+0546   0563 60          		      RTS
+0547   0564                              
+0548   0564 C9 01       case1:      CMP #1
+0549   0566 D0 08                   BNE case2
+0550   0568 98                      TYA
+0551   0569 18          		      CLC
+0552   056A 69 C0       		      ADC #0C0H
+0553   056C 20 2B 05    		      JSR LCD_command_write
+0554   056F 60          		      RTS
+0555   0570                              
+0556   0570 60          case2:      RTS
+0557   0571             
+0558   0571             ; write ASCII code to LCD at current position
+0559   0571             ; entry: A
+0560   0571             
+0561   0571 20 21 05    putch_lcd:  JSR LcdReady
+0562   0574 20 32 05                JSR LCD_data_write
+0563   0577 60                      RTS
+0564   0578             
+0565   0578 20 42 05    LcdClkInfo: JSR InitLcd
+0566   057B A2 00                   LDX #0
+0567   057D BD A3 05    l001:       LDA lcd_text_01,x
+0568   0580 F0 06                   BEQ nxttext
+0569   0582 20 71 05    		      JSR putch_lcd
+0570   0585 E8                      INX
+0571   0586 D0 F5                   BNE l001
+0572   0588 A0 00       nxttext:    LDY #0
+0573   058A A2 01                   LDX #1
+0574   058C 20 57 05                JSR goto_xy
+0575   058F A2 00                   LDX #0
+0576   0591 BD B4 05    l002:       LDA lcd_text_02,x
+0577   0594 F0 06                   BEQ lci_end
+0578   0596 20 71 05    		      JSR putch_lcd
+0579   0599 E8                      INX
+0580   059A D0 F5                   BNE l002
+0581   059C 60          lci_end:    RTS
+0582   059D                   
+0583   059D             ;-----------------------------------------------------------------------------
+0584   059D             ; Data for 7-seg display.
+0585   059D             ;
+0586   059D             ;         Dig0    Dig1    Dig2    Dig3    Dig4    Dig5
+0587   059D             ;-----------------------------------------------------------------------------
+0588   059D             
+0589   059D 9F AF B7 BB SEG .byte SEG1D1, SEG1D2, SEG1D3, SEG1D4, SEG2D1, SEG2D2
+0589   05A1 BD BE 
+0590   05A3             
+0591   05A3             ; Data below exists in ROM (firmware), so I use that instead
+0592   05A3             ;SEGTAB: ;7 segment bit patterns for character display 
+0593   05A3             ;  .BYTE 0BDH    ;'0'
+0594   05A3             ;  .BYTE 030H    ;'1'
+0595   05A3             ;  .BYTE 09BH    ;'2'
+0596   05A3             ;  .BYTE 0BAH    ;'3'
+0597   05A3             ;  .BYTE 036H    ;'4'
+0598   05A3             ;  .BYTE 0AEH    ;'5'
+0599   05A3             ;  .BYTE 0AFH    ;'6'
+0600   05A3             ;  .BYTE 038H    ;'7'
+0601   05A3             ;  .BYTE 0BFH    ;'8'
+0602   05A3             ;  .BYTE 0BEH    ;'9'
+0603   05A3             ;  .BYTE 03FH    ;'A'
+0604   05A3             ;  .BYTE 0A7H    ;'B'
+0605   05A3             ;  .BYTE 08DH    ;'C'
+0606   05A3             ;  .BYTE 0B3H    ;'D'
+0607   05A3             ;  .BYTE 08FH    ;'E'
+0608   05A3             ;  .BYTE 00FH    ;'F'
+0609   05A3             
+0610   05A3             ;-----------------------------------------------------------------------------
+0611   05A3             ; Data for LCD
+0612   05A3             ;-----------------------------------------------------------------------------
+0613   05A3             
+0614   05A3 43 6C 6F 63 lcd_text_01:   .byte "Clock running...", 0
+0614   05A7 6B 20 72 75 
+0614   05AB 6E 6E 69 6E 
+0614   05AF 67 2E 2E 2E 
+0614   05B3 00 
+0615   05B4 5B 52 45 50 lcd_text_02:   .byte "[REP]End [+]Set", 0
+0615   05B8 5D 45 6E 64 
+0615   05BC 20 5B 2B 5D 
+0615   05C0 53 65 74 00 
+0616   05C4 53 65 74 74 lcd_text_03:   .byte "Setting clock...", 0
+0616   05C8 69 6E 67 20 
+0616   05CC 63 6C 6F 63 
+0616   05D0 6B 2E 2E 2E 
+0616   05D4 00 
+0617   05D5 5B 52 45 50 lcd_text_04:   .byte "[REP/-]+/-[+]Nxt", 0
+0617   05D9 2F 2D 5D 2B 
+0617   05DD 2F 2D 5B 2B 
+0617   05E1 5D 4E 78 74 
+0617   05E5 00 
+0618   05E6               
+0619   05E6             
+0620   05E6               .END
+0621   05E6               
+tasm: Number of errors = 0
